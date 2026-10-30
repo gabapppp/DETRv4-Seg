@@ -12,12 +12,13 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-from .coco import image_path, read_json, validate_coco, write_json
+from .coco import image_path, read_json, single_class_coco, validate_coco, write_json
 from .metrics import coco_metrics
 from .prepare import split_images
 from .pyramid import p2_config, transfer_p2
+from .tracking import current_tracker, tracked_training
 from .train import select_device
-from .upstream import configuration, move_model
+from .upstream import DEFAULT_MODEL_SIZE, configuration, default_weights, move_model
 
 
 def detector_splits(coco, mapping):
@@ -136,12 +137,13 @@ def validate_detector(model, postprocessor, loader, device, label_map):
     return coco_metrics(loader.dataset.coco, predictions), predictions
 
 
+@tracked_training("det")
 def train_detector(
     annotations,
     images_root,
     output,
     repo="vendor/RT-DETRv4",
-    pretrained="weights/rtv4_s_coco.pth",
+    pretrained=None,
     split_report=None,
     steps=600,
     batch_size=4,
@@ -155,7 +157,16 @@ def train_detector(
     patience=0,
     p2=False,
     ema_decay=0.0,
+    model_size=DEFAULT_MODEL_SIZE,
+    mlflow_uri=None,
+    mlflow_experiment=None,
+    mlflow_run_name=None,
+    mlflow_log_every=20,
+    single_class=False,
+    class_name="ball",
 ):
+    selected_weights = default_weights(model_size)
+    pretrained = pretrained if pretrained is not None else selected_weights
     if (
         min(steps, batch_size, val_every, threads, lr, budget_seconds) <= 0
         or patience < 0
@@ -167,6 +178,7 @@ def train_detector(
             "Positive training options required; detector size must be >=128 and a multiple of 32"
         )
     start = time.monotonic()
+    tracker = current_tracker()
     output, repo = Path(output).resolve(), Path(repo).resolve()
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Output is not empty: {output}")
@@ -176,6 +188,8 @@ def train_detector(
     torch.set_num_threads(threads)
     device = select_device(device)
     coco = read_json(annotations)
+    if single_class:
+        coco = single_class_coco(coco, class_name)
     validate_coco(coco, images_root)
     mapping = (
         read_json(split_report)["image_splits"]
@@ -184,15 +198,19 @@ def train_detector(
     )
     splits, label_map = detector_splits(coco, mapping)
     output.mkdir(parents=True, exist_ok=True)
+    tracker.attach_output(output)
     for split, subset in splits.items():
         write_json(output / f"{split}.json", subset)
     write_json(output / "label_map.json", label_map)
-    # Same S student architecture as the official checkpoint. Teacher is used only in
+    state = torch.load(pretrained, map_location="cpu", weights_only=True)
+    if state.get("model_size", model_size) != model_size:
+        raise ValueError("Checkpoint model size differs from --model-size")
+    # Match the selected student architecture. Teacher is used only in
     # original pretraining; supervised custom-dataset fine-tuning needs no DINO files.
     import yaml
 
     config = {
-        "__include__": [str(repo / "configs/rtv4/rtv4_hgnetv2_s_coco.yml")],
+        "__include__": [str(repo / f"configs/rtv4/rtv4_hgnetv2_{model_size}_coco.yml")],
         "num_classes": len(label_map),
         "remap_mscoco_category": False,
         "eval_spatial_size": [size, size],
@@ -202,7 +220,7 @@ def train_detector(
     }
     config_path = output / "config.yml"
     if p2:
-        for key, value in p2_config().items():
+        for key, value in p2_config(model_size).items():
             config.setdefault(key, {}).update(value)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     cfg = configuration(repo, config_path)
@@ -211,7 +229,6 @@ def train_detector(
     resolved = {key: value for key, value in cfg.yaml_cfg.items() if key != "__include__"}
     config_path.write_text(yaml.safe_dump(resolved, sort_keys=False))
     model = cfg.model
-    state = torch.load(pretrained, map_location="cpu", weights_only=True)
     if (
         "label_map" in state
         and {int(k): int(v) for k, v in state["label_map"].items()} != label_map
@@ -264,6 +281,19 @@ def train_detector(
         )
         for s, ds in datasets.items()
     }
+    tracker.params(
+        {
+            "effective_device": str(device),
+            "effective_amp": device.type == "cuda",
+            "torch_version": str(torch.__version__),
+            "pretrained_weights": str(Path(pretrained).resolve()),
+            "train_images": len(datasets["train"]),
+            "val_images": len(datasets["val"]),
+            "num_classes": len(label_map),
+            "parameters": sum(p.numel() for p in model.parameters()),
+            "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "none",
+        }
+    )
     optimizer = torch.optim.AdamW(
         [
             {
@@ -296,6 +326,7 @@ def train_detector(
                 "input_size": size,
                 "seed": seed,
                 "p2": p2,
+                "model_size": model_size,
                 "ema_decay": ema_decay,
             },
             path,
@@ -322,6 +353,16 @@ def train_detector(
         else:
             stale_validations += 1
         write_json(output / "history.json", history)
+        tracker.metrics(
+            {
+                **{f"val/{key}": value for key, value in metrics.items()},
+                "best/AP": best_ap,
+                "best/step": best_step,
+                "time/elapsed_seconds": time.monotonic() - start,
+            },
+            step=completed,
+            synchronous=True,
+        )
         print(
             f"detector step={completed} AP={metrics['AP']:.4f} AP50={metrics['AP50']:.4f}",
             flush=True,
@@ -369,6 +410,17 @@ def train_detector(
         if ema_model is not None:
             update_ema(ema_model, model, ema_decay)
         completed += 1
+        if tracker.should_log(completed, last=completed == steps):
+            tracker.metrics(
+                {
+                    "train/loss": loss.item(),
+                    **{f"train/{key}": value.item() for key, value in losses.items()},
+                    "train/lr": optimizer.param_groups[-1]["lr"],
+                    "train/lr_backbone": optimizer.param_groups[0]["lr"],
+                    "time/elapsed_seconds": time.monotonic() - start,
+                },
+                step=completed,
+            )
         if completed % 20 == 0:
             print(f"detector step={completed} loss={loss.item():.4f}", flush=True)
         if completed % val_every == 0 or completed == steps:
@@ -409,9 +461,22 @@ def train_detector(
         "seed": seed,
         "patience": patience,
         "p2": p2,
+        "model_size": model_size,
         "amp": device.type == "cuda",
         "ema_decay": ema_decay,
         "val_every": val_every,
+        "single_class": single_class,
+        "class_name": class_name if single_class else None,
     }
     write_json(output / "summary.json", summary)
+    tracker.metrics(
+        {
+            "run/steps": completed,
+            "run/elapsed_seconds": summary["elapsed_seconds"],
+            "run/stopped_by_budget": int(summary["budget_exhausted"]),
+            "run/early_stopped": int(summary["early_stopped"]),
+            "system/peak_cuda_allocated_mb": summary["peak_cuda_allocated_mb"],
+        },
+        step=completed,
+    )
     return summary

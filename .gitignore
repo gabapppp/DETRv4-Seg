@@ -1,5 +1,7 @@
 /dataset/
 /.venv/
+/.venv-viewer/
+/.venv-train/
 /runs/
 /vendor/
 /weights/

@@ -13,10 +13,11 @@ from torch.utils.data import DataLoader, Dataset
 from .coco import read_json, write_json
 from .model import make_mask_head, mask_loss
 from .roi import bbox_prior
+from .tracking import current_tracker, tracked_training
 
 
 class CropDataset(Dataset):
-    def __init__(self, path, augment=False, bbox_jitter=0.0):
+    def __init__(self, path, augment=False, bbox_jitter=0.0, preserve_native=False):
         with np.load(path, allow_pickle=False) as data:
             self.rgb = data["rgb"]
             self.prior = data["prior"]
@@ -24,6 +25,7 @@ class CropDataset(Dataset):
             self.image_ids = data["image_ids"]
         self.augment = augment
         self.bbox_jitter = bbox_jitter
+        self.preserve_native = preserve_native
 
     def __len__(self):
         return len(self.rgb)
@@ -33,9 +35,23 @@ class CropDataset(Dataset):
         if self.augment:
             size = rgb.shape[0]
             # Shift/zoom all three together: labels stay aligned while crop context varies.
-            matrix = cv2.getRotationMatrix2D((size / 2, size / 2), 0, np.random.uniform(0.92, 1.08))
-            matrix[:, 2] += np.random.uniform(-0.04, 0.04, 2) * size
-            rgb = cv2.warpAffine(rgb, matrix, (size, size), borderMode=cv2.BORDER_REFLECT_101)
+            if self.preserve_native:
+                # Integer translations preserve tiny native edges without rescaling.
+                shift = max(1, round(0.04 * size))
+                dx, dy = np.random.randint(-shift, shift + 1, 2)
+                matrix = np.array([[1, 0, dx], [0, 1, dy]], np.float32)
+            else:
+                matrix = cv2.getRotationMatrix2D(
+                    (size / 2, size / 2), 0, np.random.uniform(0.92, 1.08)
+                )
+                matrix[:, 2] += np.random.uniform(-0.04, 0.04, 2) * size
+            rgb = cv2.warpAffine(
+                rgb,
+                matrix,
+                (size, size),
+                borderMode=cv2.BORDER_REFLECT_101,
+                flags=cv2.INTER_NEAREST if self.preserve_native else cv2.INTER_LINEAR,
+            )
             prior = cv2.warpAffine(prior, matrix, (size, size), flags=cv2.INTER_NEAREST)
             mask = cv2.warpAffine(mask, matrix, (size, size), flags=cv2.INTER_NEAREST)
             if np.random.random() < 0.5:
@@ -110,6 +126,7 @@ def validate(model, loader, device, amp):
     return dict(zip(("loss", "iou", "dice"), (totals / count).tolist()))
 
 
+@tracked_training("seg")
 def train(
     cache,
     output,
@@ -126,10 +143,16 @@ def train(
     architecture="tiny",
     pretrained_encoder=True,
     initial_checkpoint=None,
+    mlflow_uri=None,
+    mlflow_experiment=None,
+    mlflow_run_name=None,
+    mlflow_log_every=20,
+    width=16,
 ):
     if min(steps, budget_seconds, batch_size, val_every, threads) <= 0 or workers < 0 or lr <= 0:
         raise ValueError("Training arguments must be positive (workers may be zero)")
     start = time.monotonic()
+    tracker = current_tracker()
     output, cache = Path(output), Path(cache)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Output is not empty: {output}. Choose a new run directory.")
@@ -145,7 +168,13 @@ def train(
         torch.cuda.reset_peak_memory_stats(device)
     report = read_json(cache / "report.json")
     bbox_jitter = min(0.15, report["settings"].get("mask_overflow", 0.0) * 0.6)
-    training = CropDataset(cache / "train.npz", augment=True, bbox_jitter=bbox_jitter)
+    roi_resize_mode = report["settings"].get("roi_resize_mode", "resize")
+    training = CropDataset(
+        cache / "train.npz",
+        augment=True,
+        bbox_jitter=bbox_jitter,
+        preserve_native=roi_resize_mode == "native",
+    )
     validation = CropDataset(cache / "val.npz")
     if set(training.image_ids) & set(validation.image_ids):
         raise ValueError("Image leakage between train and validation cache")
@@ -160,11 +189,15 @@ def train(
     }
     loader = DataLoader(training, shuffle=True, generator=generator, **loader_args)
     val_loader = DataLoader(validation, shuffle=False, **loader_args)
-    model = make_mask_head(architecture, pretrained=pretrained_encoder and not initial_checkpoint)
+    model = make_mask_head(
+        architecture, width=width, pretrained=pretrained_encoder and not initial_checkpoint
+    )
     if initial_checkpoint:
         starting = torch.load(initial_checkpoint, map_location="cpu", weights_only=True)
         if starting.get("architecture", "tiny") != architecture:
             raise ValueError("Initial checkpoint architecture differs from the requested mask head")
+        if architecture != "resnet18_unet" and starting.get("width", 16) != width:
+            raise ValueError("Initial checkpoint width differs from --width")
         model.load_state_dict(starting["model"])
     model = model.to(device)
     if architecture == "resnet18_unet":
@@ -180,6 +213,23 @@ def train(
     optimizer = torch.optim.AdamW(groups, lr=lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     output.mkdir(parents=True, exist_ok=True)
+    tracker.attach_output(output)
+    tracker.params(
+        {
+            "effective_device": str(device),
+            "effective_amp": amp,
+            "torch_version": str(torch.__version__),
+            "roi_size": report["settings"]["roi_size"],
+            "roi_resize_mode": roi_resize_mode,
+            "padding": report["settings"]["padding"],
+            "mask_overflow": report["settings"].get("mask_overflow", 0.0),
+            "fill_mode": report["settings"].get("fill_mode", "holes"),
+            "train_objects": len(training),
+            "val_objects": len(validation),
+            "parameters": sum(p.numel() for p in model.parameters()),
+            "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "none",
+        }
+    )
     best_iou, best_step, best_metrics = -1.0, 0, None
     history, completed = [], 0
 
@@ -188,8 +238,9 @@ def train(
             "format_version": 1,
             "architecture": architecture,
             "model": copy.deepcopy(model.state_dict()),
-            "width": 16,
+            "width": width,
             "roi_size": report["settings"]["roi_size"],
+            "roi_resize_mode": roi_resize_mode,
             "padding": report["settings"]["padding"],
             "mask_overflow": report["settings"].get("mask_overflow", 0.0),
             "bbox_jitter": bbox_jitter,
@@ -202,6 +253,18 @@ def train(
             "seed": seed,
         }
 
+    def log_validation(metrics, step):
+        tracker.metrics(
+            {
+                **{f"val/{key}": value for key, value in metrics.items()},
+                **{f"best/{key}": value for key, value in best_metrics.items()},
+                "best/step": best_step,
+                "time/elapsed_seconds": time.monotonic() - start,
+            },
+            step=step,
+            synchronous=True,
+        )
+
     iterator = iter(loader)
     if initial_checkpoint:
         initial_metrics = validate(model, val_loader, device, amp)
@@ -210,6 +273,7 @@ def train(
             {"step": 0, "val": initial_metrics, "elapsed_seconds": time.monotonic() - start}
         )
         torch.save(checkpoint(0, initial_metrics), output / "best.pt")
+        log_validation(initial_metrics, 0)
     while completed < steps:
         if time.monotonic() - start >= budget_seconds:
             break
@@ -233,6 +297,16 @@ def train(
         scaler.step(optimizer)
         scaler.update()
         completed += 1
+        if tracker.should_log(completed, last=completed == steps):
+            tracker.metrics(
+                {
+                    "train/loss": loss.item(),
+                    "train/lr": optimizer.param_groups[-1]["lr"],
+                    "train/lr_encoder": optimizer.param_groups[0]["lr"],
+                    "time/elapsed_seconds": time.monotonic() - start,
+                },
+                step=completed,
+            )
         if completed % val_every == 0 or completed == steps:
             metrics = validate(model, val_loader, device, amp)
             history.append(
@@ -252,6 +326,7 @@ def train(
                 best_iou, best_step, best_metrics = metrics["iou"], completed, metrics
                 torch.save(checkpoint(completed, metrics), output / "best.pt")
             write_json(output / "history.json", history)
+            log_validation(metrics, completed)
     if completed == 0:
         raise ValueError("Time budget expired during setup, before the first training step")
     if not history or history[-1]["step"] != completed:
@@ -262,6 +337,7 @@ def train(
         if metrics["iou"] > best_iou:
             best_iou, best_step, best_metrics = metrics["iou"], completed, metrics
             torch.save(checkpoint(completed, metrics), output / "best.pt")
+        log_validation(metrics, completed)
     torch.save(checkpoint(completed, history[-1]["val"]), output / "last.pt")
     summary = {
         "steps": completed,
@@ -300,4 +376,13 @@ def train(
     }
     write_json(output / "history.json", history)
     write_json(output / "summary.json", summary)
+    tracker.metrics(
+        {
+            "run/steps": completed,
+            "run/elapsed_seconds": summary["elapsed_seconds"],
+            "run/stopped_by_budget": int(summary["stopped_by_budget"]),
+            "system/peak_cuda_allocated_mb": summary["peak_cuda_allocated_mb"],
+        },
+        step=completed,
+    )
     return summary

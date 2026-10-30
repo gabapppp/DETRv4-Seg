@@ -3,11 +3,14 @@
 import re
 
 
-def p2_config():
+def p2_config(model_size="s"):
+    channels = {"s": [64, 256, 512, 1024], "m": [96, 384, 768, 1536]}
+    if model_size not in channels:
+        raise ValueError(f"Unsupported detector model size: {model_size}")
     return {
         "HGNetv2": {"return_idx": [0, 1, 2, 3]},
         "HybridEncoder": {
-            "in_channels": [64, 256, 512, 1024],
+            "in_channels": channels[model_size],
             "feat_strides": [4, 8, 16, 32],
             "use_encoder_idx": [3],
         },

@@ -30,12 +30,50 @@ def bbox_prior(bbox, bounds):
     )
 
 
-def roi_inputs(image, bbox, size, padding):
+def roi_content_bounds(bounds, size, resize_mode="resize"):
+    if resize_mode == "resize":
+        return 0, 0, size, size
+    if resize_mode != "native":
+        raise ValueError("ROI resize mode must be resize or native")
+    x0, y0, x1, y1 = bounds
+    width, height = x1 - x0, y1 - y0
+    if width > size or height > size:
+        raise ValueError(
+            f"Native ROI {width}x{height} exceeds {size}x{size} canvas. "
+            f"Increase --size to at least {max(width, height)}; native mode never downsamples."
+        )
+    left, top = (size - width) // 2, (size - height) // 2
+    return left, top, left + width, top + height
+
+
+def roi_canvas(array, size, resize_mode="resize", interpolation=cv2.INTER_LINEAR):
+    """Resize legacy ROIs, or copy native pixels into a centered zero-padded canvas."""
+    height, width = array.shape[:2]
+    left, top, right, bottom = roi_content_bounds((0, 0, width, height), size, resize_mode)
+    if resize_mode == "resize":
+        return cv2.resize(array, (size, size), interpolation=interpolation)
+    canvas = np.zeros((size, size, *array.shape[2:]), dtype=array.dtype)
+    canvas[top:bottom, left:right] = array
+    return canvas
+
+
+def restore_roi(probability, bounds, resize_mode="resize"):
+    """Undo ROI input geometry before thresholding at native image coordinates."""
+    x0, y0, x1, y1 = bounds
+    if resize_mode == "resize":
+        return cv2.resize(probability, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+    if probability.ndim != 2 or probability.shape[0] != probability.shape[1]:
+        raise ValueError("Native ROI prediction must have the square input canvas shape")
+    left, top, right, bottom = roi_content_bounds(bounds, probability.shape[0], resize_mode)
+    return probability[top:bottom, left:right]
+
+
+def roi_inputs(image, bbox, size, padding, resize_mode="resize"):
     height, width = image.shape[:2]
     bounds = roi_bounds(bbox, width, height, padding)
     x0, y0, x1, y1 = bounds
-    rgb = cv2.resize(image[y0:y1, x0:x1], (size, size), interpolation=cv2.INTER_LINEAR)
-    prior = cv2.resize(bbox_prior(bbox, bounds), (size, size), interpolation=cv2.INTER_NEAREST)
+    rgb = roi_canvas(image[y0:y1, x0:x1], size, resize_mode)
+    prior = roi_canvas(bbox_prior(bbox, bounds), size, resize_mode, cv2.INTER_NEAREST)
     return rgb, prior, bounds
 
 

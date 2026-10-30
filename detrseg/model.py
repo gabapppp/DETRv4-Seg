@@ -48,6 +48,39 @@ class TinyMaskHead(nn.Module):
         return self.out(d1)
 
 
+class TinyUNetMaskHead(nn.Module):
+    """Shallow U-Net with a full-resolution detail path for 20–30 px objects.
+
+    Only the context path is pooled once. Original RGB/prior values and stride-1
+    detail features reach the decoder directly; no ResNet/ImageNet dependency.
+    """
+
+    def __init__(self, width=16):
+        super().__init__()
+        if width < 4 or width % 4:
+            raise ValueError("Tiny U-Net width must be a positive multiple of four")
+        self.detail = block(4, width)
+        self.encoder = block(width, width * 2)
+        channels = width * 2
+        self.context = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=2, dilation=2, groups=channels, bias=False),
+            nn.GroupNorm(4, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.GroupNorm(4, channels),
+            nn.SiLU(inplace=True),
+        )
+        self.decoder = block(width * 3 + 4, width)
+        self.out = nn.Conv2d(width, 1, 1)
+
+    def forward(self, x):
+        detail = self.detail(x)
+        encoded = self.encoder(F.avg_pool2d(detail, 2))
+        context = encoded + self.context(encoded)
+        context = F.interpolate(context, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return self.out(self.decoder(torch.cat((context, detail, x), dim=1)))
+
+
 class ResNet18MaskHead(nn.Module):
     """Pretrained four-channel encoder with P1–P5 skips and a full-resolution detail path."""
 
@@ -112,6 +145,8 @@ class ResNet18MaskHead(nn.Module):
 def make_mask_head(architecture="tiny", width=16, pretrained=False):
     if architecture == "tiny":
         return TinyMaskHead(width)
+    if architecture == "tiny_unet":
+        return TinyUNetMaskHead(width)
     if architecture == "resnet18_unet":
         return ResNet18MaskHead(pretrained)
     raise ValueError(f"Unsupported mask architecture: {architecture}")

@@ -31,6 +31,23 @@ def image_path(root, filename):
     return path
 
 
+def single_class_coco(coco, name="ball", target_id=1):
+    """Make one semantic class without merging or deleting distinct instances."""
+    if not name.strip() or target_id < 0:
+        raise ValueError("Single class needs a nonempty name and nonnegative ID")
+    categories = coco["categories"]
+    ids = {category["id"] for category in categories}
+    if not ids or len(ids) != len(categories):
+        raise ValueError("COCO categories must have unique IDs and contain at least one class")
+    if any(ann["category_id"] not in ids for ann in coco["annotations"]):
+        raise ValueError("Annotation category ID is absent from categories")
+    return {
+        **coco,
+        "categories": [{"id": target_id, "name": name.strip(), "supercategory": "object"}],
+        "annotations": [{**ann, "category_id": target_id} for ann in coco["annotations"]],
+    }
+
+
 def encode_mask(mask):
     rle = mask_api.encode(np.asfortranarray(mask.astype(np.uint8)))
     return {"size": rle["size"], "counts": rle["counts"].decode("ascii")}

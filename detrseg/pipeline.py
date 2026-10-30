@@ -17,7 +17,7 @@ from .infer import MaskPredictor, infer
 from .metrics import coco_metrics
 from .prepare import prepare
 from .train import train
-from .upstream import bootstrap
+from .upstream import DEFAULT_MODEL_SIZE, bootstrap
 
 
 def bundle_paths(bundle):
@@ -234,7 +234,7 @@ def fit(
     images_root,
     output,
     repo="vendor/RT-DETRv4",
-    pretrained="weights/rtv4_s_coco.pth",
+    pretrained=None,
     detector_steps=600,
     mask_steps=600,
     budget_seconds=1800,
@@ -249,6 +249,11 @@ def fit(
     mask_overflow=0.25,
     p2=False,
     mask_architecture="tiny",
+    model_size=DEFAULT_MODEL_SIZE,
+    mlflow_uri=None,
+    mlflow_experiment=None,
+    mlflow_run_name=None,
+    mlflow_log_every=20,
 ):
     output = Path(output).resolve()
     if output.exists() and any(output.iterdir()):
@@ -266,7 +271,7 @@ def fit(
             )
         return left
 
-    bootstrap(repo, pretrained)
+    bootstrap(repo, pretrained, model_size=model_size)
     prepare(
         annotations,
         images_root,
@@ -287,6 +292,10 @@ def fit(
         budget_seconds=min(1020, remaining() * 0.2),
         device=device,
         seed=seed,
+        mlflow_uri=mlflow_uri,
+        mlflow_experiment=mlflow_experiment,
+        mlflow_run_name=f"{mlflow_run_name}-seg" if mlflow_run_name else None,
+        mlflow_log_every=mlflow_log_every,
     )
     train_detector(
         annotations,
@@ -302,6 +311,11 @@ def fit(
         size=detector_size,
         batch_size=detector_batch_size,
         p2=p2,
+        model_size=model_size,
+        mlflow_uri=mlflow_uri,
+        mlflow_experiment=mlflow_experiment,
+        mlflow_run_name=f"{mlflow_run_name}-det" if mlflow_run_name else None,
+        mlflow_log_every=mlflow_log_every,
     )
     bundle = {
         "format_version": 1,

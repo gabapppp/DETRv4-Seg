@@ -10,7 +10,7 @@ import torch
 
 from .coco import encode_mask, image_path, read_json, write_json
 from .model import make_mask_head
-from .roi import bbox_prior, clean_component, mask_support, roi_inputs
+from .roi import bbox_prior, clean_component, mask_support, restore_roi, roi_inputs
 from .train import select_device
 
 
@@ -21,6 +21,9 @@ class MaskPredictor:
         if state.get("format_version") != 1:
             raise ValueError("Unsupported mask checkpoint format")
         self.size, self.padding = state["roi_size"], state["padding"]
+        self.roi_resize_mode = state.get("roi_resize_mode", "resize")
+        if self.roi_resize_mode not in ("resize", "native"):
+            raise ValueError("Unsupported checkpoint ROI resize mode")
         self.mask_overflow = state.get("mask_overflow", 0.0)
         if not 0 <= self.mask_overflow <= self.padding:
             raise ValueError("Checkpoint mask overflow exceeds crop padding")
@@ -38,7 +41,10 @@ class MaskPredictor:
         masks, qualities = [], []
         for start in range(0, len(boxes), batch_size):
             selected = boxes[start : start + batch_size]
-            crops = [roi_inputs(rgb, box, self.size, self.padding) for box in selected]
+            crops = [
+                roi_inputs(rgb, box, self.size, self.padding, self.roi_resize_mode)
+                for box in selected
+            ]
             if any(not prior.any() for _, prior, _ in crops):
                 raise ValueError("A detection bbox is too small to form a pixel mask")
             inputs = np.stack(
@@ -55,9 +61,7 @@ class MaskPredictor:
             for box, (_, _, bounds), probability in zip(selected, crops, probabilities):
                 x0, y0, x1, y1 = bounds
                 # Resize probabilities before thresholding to preserve sub-ROI edge information.
-                restored = cv2.resize(
-                    probability, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR
-                )
+                restored = restore_roi(probability, bounds, self.roi_resize_mode)
                 prior = bbox_prior(box, bounds)
                 support = mask_support(box, bounds, self.mask_overflow)
                 component, _ = clean_component(

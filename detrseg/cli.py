@@ -3,6 +3,8 @@ import json
 import sys
 
 from .coco import convert_cvat, read_json, validate_coco, write_json
+from .tracking import add_tracking_arguments
+from .upstream import DEFAULT_MODEL_SIZE, MODEL_SIZES
 
 
 def build_parser():
@@ -21,6 +23,7 @@ def build_parser():
     prepare.add_argument("--images", required=True)
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--size", type=int, default=96)
+    prepare.add_argument("--roi-resize-mode", choices=("resize", "native"), default="resize")
     prepare.add_argument("--padding", type=float, default=0.25)
     prepare.add_argument(
         "--mask-overflow",
@@ -40,6 +43,7 @@ def build_parser():
     )
     prepare.add_argument("--budget-seconds", type=float, default=420)
     prepare.add_argument("--groups", help='JSON map {"image_id": "independent_source_group"}')
+    prepare.add_argument("--split-report", help="Reuse image_splits from an existing split report")
     train = commands.add_parser("train", help="Train just the ROI head with BCE + Dice")
     train.add_argument("--cache", required=True)
     train.add_argument("--output", required=True)
@@ -50,12 +54,16 @@ def build_parser():
     train.add_argument("--device", default="auto")
     train.add_argument("--workers", type=int, default=0)
     train.add_argument("--threads", type=int, default=4)
-    train.add_argument("--architecture", choices=("tiny", "resnet18_unet"), default="tiny")
+    train.add_argument(
+        "--architecture", choices=("tiny", "tiny_unet", "resnet18_unet"), default="tiny"
+    )
+    train.add_argument("--width", type=int, default=16)
     train.add_argument("--no-pretrained-encoder", action="store_true")
     train.add_argument("--initial-checkpoint")
     train.add_argument("--val-every", type=int, default=100)
     train.add_argument("--seed", type=int, default=42)
     train.add_argument("--no-amp", action="store_true")
+    add_tracking_arguments(train)
     infer = commands.add_parser("infer", help="Attach native-image RLE masks to detection results")
     infer.add_argument("--annotations", required=True)
     infer.add_argument("--images", required=True)
@@ -86,18 +94,30 @@ def build_parser():
     detect.add_argument("--score-threshold", type=float, default=0.25)
     detect.add_argument("--size", type=int)
     setup = commands.add_parser(
-        "setup-detector", help="Fetch pinned official RT-DETRv4 S and COCO weights"
+        "setup-detector", help="Fetch pinned official RT-DETRv4 and COCO weights (default: M)"
     )
     setup.add_argument("--repo", default="vendor/RT-DETRv4")
-    setup.add_argument("--weights", default="weights/rtv4_s_coco.pth")
+    setup.add_argument("--model-size", choices=MODEL_SIZES, default=DEFAULT_MODEL_SIZE)
+    setup.add_argument(
+        "--weights", help="Destination path; default: weights/rtv4_<model-size>_coco.pth"
+    )
     detector_train = commands.add_parser(
         "train-detector", help="Fine-tune the RT-DETRv4 student on custom boxes"
     )
     for name in ("annotations", "images", "output"):
         detector_train.add_argument(f"--{name}", required=True)
     detector_train.add_argument("--repo", default="vendor/RT-DETRv4")
-    detector_train.add_argument("--pretrained", default="weights/rtv4_s_coco.pth")
+    detector_train.add_argument("--model-size", choices=MODEL_SIZES, default=DEFAULT_MODEL_SIZE)
+    detector_train.add_argument(
+        "--pretrained", help="Initial checkpoint; defaults to selected COCO weights"
+    )
     detector_train.add_argument("--split-report")
+    detector_train.add_argument(
+        "--single-class",
+        action="store_true",
+        help="Merge all dataset labels into one class for training",
+    )
+    detector_train.add_argument("--class-name", default="ball")
     detector_train.add_argument("--steps", type=int, default=600)
     detector_train.add_argument("--batch-size", type=int, default=4)
     detector_train.add_argument("--size", type=int, default=640)
@@ -122,13 +142,16 @@ def build_parser():
         default=0,
         help="Stop after this many validations without higher AP; 0 disables",
     )
+    add_tracking_arguments(detector_train)
     fit = commands.add_parser(
         "fit", help="Prepare masks, train both models, validate, and write a pipeline bundle"
     )
+    add_tracking_arguments(fit)
     for name in ("annotations", "images", "output"):
         fit.add_argument(f"--{name}", required=True)
     fit.add_argument("--repo", default="vendor/RT-DETRv4")
-    fit.add_argument("--pretrained", default="weights/rtv4_s_coco.pth")
+    fit.add_argument("--model-size", choices=MODEL_SIZES, default=DEFAULT_MODEL_SIZE)
+    fit.add_argument("--pretrained", help="Initial checkpoint; defaults to selected COCO weights")
     fit.add_argument("--detector-steps", type=int, default=600)
     fit.add_argument("--mask-steps", type=int, default=600)
     fit.add_argument("--budget-seconds", type=float, default=1800)
@@ -142,7 +165,9 @@ def build_parser():
     fit.add_argument("--padding", type=float, default=0.25)
     fit.add_argument("--mask-overflow", type=float, default=0.25)
     fit.add_argument("--p2", action="store_true")
-    fit.add_argument("--mask-architecture", choices=("tiny", "resnet18_unet"), default="tiny")
+    fit.add_argument(
+        "--mask-architecture", choices=("tiny", "tiny_unet", "resnet18_unet"), default="tiny"
+    )
     predict = commands.add_parser(
         "predict", help="Image/folder → detector → masks, overlays, COCO JSON and CSV"
     )

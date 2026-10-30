@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from .coco import decode_mask, encode_mask, image_path, read_json, validate_coco, write_json
-from .roi import pseudo_mask, roi_inputs
+from .roi import pseudo_mask, roi_canvas, roi_inputs
 
 
 def split_images(images, val_fraction, seed, group_map=None):
@@ -27,6 +27,25 @@ def split_images(images, val_fraction, seed, group_map=None):
     n = min(len(keys) - 1, max(1, round(len(keys) * val_fraction)))
     val_ids = {image_id for key in keys[:n] for image_id in groups[key]}
     return {im["id"]: "val" if im["id"] in val_ids else "train" for im in images}
+
+
+def fixed_splits(images, report, group_map=None):
+    """Reuse a materialized dataset split without randomly splitting it again."""
+    values = report["image_splits"]
+    if not isinstance(values, dict) or set(values) != {str(im["id"]) for im in images}:
+        raise ValueError("Split report must cover exactly the current COCO image IDs")
+    if set(values.values()) != {"train", "val"}:
+        raise ValueError("Split report must contain nonempty train and val splits only")
+    result = {im["id"]: values[str(im["id"])] for im in images}
+    if group_map is not None:
+        seen = {}
+        for im in images:
+            group = str(group_map[str(im["id"])])
+            split = result[im["id"]]
+            if group in seen and seen[group] != split:
+                raise ValueError(f"Source group crosses train/val: {group}")
+            seen[group] = split
+    return result
 
 
 def preview_grid(items, output, size=160):
@@ -69,19 +88,26 @@ def prepare(
     groups=None,
     fill_mode="holes",
     mask_overflow=0.0,
+    split_report=None,
+    roi_resize_mode="resize",
 ):
     if size < 16 or padding <= 0 or max_objects < 2 or budget_seconds <= 0:
         raise ValueError("size >= 16, padding > 0, max_objects >= 2, budget_seconds > 0 required")
     if not 0 <= mask_overflow <= padding:
         raise ValueError("mask_overflow must be between zero and crop padding")
+    if roi_resize_mode not in ("resize", "native"):
+        raise ValueError("ROI resize mode must be resize or native")
     start = time.monotonic()
     output = Path(output)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Output is not empty: {output}. Choose a new cache directory.")
     coco = read_json(annotations)
     audit = validate_coco(coco, images_root)
-    mapping = split_images(
-        coco["images"], val_fraction, seed, read_json(groups) if groups else None
+    group_map = read_json(groups) if groups else None
+    mapping = (
+        fixed_splits(coco["images"], read_json(split_report), group_map)
+        if split_report
+        else split_images(coco["images"], val_fraction, seed, group_map)
     )
     output.mkdir(parents=True, exist_ok=True)
     images = {im["id"]: im for im in coco["images"]}
@@ -122,9 +148,9 @@ def prepare(
         if mask is None:
             rejected.append({"id": ann["id"], **quality})
             continue
-        crop, prior, bounds = roi_inputs(rgb, ann["bbox"], size, padding)
+        crop, prior, bounds = roi_inputs(rgb, ann["bbox"], size, padding, roi_resize_mode)
         x0, y0, x1, y1 = bounds
-        target = cv2.resize(mask[y0:y1, x0:x1], (size, size), interpolation=cv2.INTER_NEAREST)
+        target = roi_canvas(mask[y0:y1, x0:x1], size, roi_resize_mode, cv2.INTER_NEAREST)
         if not target.any() or not prior.any():
             rejected.append({"id": ann["id"], "reason": "empty_resized_mask_or_bbox"})
             continue
@@ -153,6 +179,7 @@ def prepare(
             previews.append((crop, target, f"id={ann['id']} {split} {label}"))
     settings = {
         "roi_size": size,
+        "roi_resize_mode": roi_resize_mode,
         "padding": padding,
         "mask_overflow": mask_overflow,
         "pseudo_labels_clipped_to_annotation_bbox": True,
@@ -164,6 +191,7 @@ def prepare(
         "annotations_sha256": hashlib.sha256(Path(annotations).read_bytes()).hexdigest(),
         "images_root": str(Path(images_root).resolve()),
         "group_file": str(Path(groups).resolve()) if groups else None,
+        "split_report": str(Path(split_report).resolve()) if split_report else None,
         "fill_mode": fill_mode,
     }
     report = {
